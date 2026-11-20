@@ -26,6 +26,8 @@ WEB_QR_USER_AGENT = (
 _WEAPI_IV = b"0102030405060708"
 _WEAPI_PRESET_KEY = b"0CoJUm6Qyw8W8jud"
 _WEAPI_BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+_EAPI_KEY = b"e82ckenh8dichen8"
+_EAPI_DELIMITER = "-36cd479b6b5-"
 _WEAPI_PUBLIC_KEY = b"""-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDgtQn2JZ34ZC28NWYpAUd98iZ37BUrX/aKzmFbt7clFSs6sXqHauqKWqdtLkF2KexO40H1YTX8z2lSgBBOAxLsvaklV8k4cBFK9snQXE9/DDaFt6Rr7iVZMldczhC0JNgTz+SHXT6CBHuX3e9SdB1Ua44oncaTWz7OBGLbCiK45wIDAQAB
 -----END PUBLIC KEY-----"""
@@ -151,6 +153,22 @@ def weapi_encrypt(payload: str, secret_key: str | None = None) -> dict[str, str]
         int.from_bytes(reversed_key, "big"), public_key.e, public_key.n
     )
     return {"params": params, "encSecKey": format(encrypted_key, "x").zfill(256)}
+
+
+def eapi_encrypt(path: str, payload: str) -> dict[str, str]:
+    """Produce the standard NetEase desktop-client EAPI form field."""
+    if not isinstance(path, str) or not path.startswith("/api/"):
+        raise ValueError("The NetEase EAPI path is invalid.")
+    if not isinstance(payload, str):
+        raise ValueError("The NetEase EAPI payload is invalid.")
+    digest = hashlib.md5(
+        f"nobody{path}use{payload}md5forencrypt".encode("utf-8")
+    ).hexdigest()
+    plaintext = f"{path}{_EAPI_DELIMITER}{payload}{_EAPI_DELIMITER}{digest}"
+    encrypted = AES.new(_EAPI_KEY, AES.MODE_ECB).encrypt(
+        _pkcs7_pad(plaintext.encode("utf-8"))
+    )
+    return {"params": encrypted.hex().upper()}
 
 
 def qr_png(payload: str) -> bytes:

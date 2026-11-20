@@ -17,7 +17,6 @@ import logging
 import os
 import re
 import secrets
-import subprocess
 import threading
 import time
 import uuid
@@ -35,6 +34,7 @@ from netease_session import (
     SessionManager,
     cookie_from_login_response,
     create_web_qr_context,
+    eapi_encrypt,
     merge_cookie_values,
     parse_cookie,
     qr_png,
@@ -886,6 +886,75 @@ def _netease_weapi_request(path: str, data: dict[str, Any] | None = None) -> dic
     return result
 
 
+def _netease_eapi_request(path: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Call one closed NetEase desktop-client EAPI endpoint."""
+    cookie = _require_cookie()
+    parsed_cookie = parse_cookie(cookie)
+    csrf = parsed_cookie.get("__csrf", "")
+    now_ms = int(time.time() * 1000)
+    header: dict[str, str] = {
+        "osver": "Microsoft-Windows-10-Professional-build-19045-64bit",
+        "deviceId": hashlib.sha256(cookie.encode("utf-8")).hexdigest()[:32],
+        "os": "pc",
+        "appver": "3.1.17.204416",
+        "versioncode": "140",
+        "mobilename": "",
+        "buildver": str(now_ms)[:10],
+        "resolution": "1920x1080",
+        "__csrf": csrf,
+        "channel": "netease",
+        "requestId": f"{now_ms}_{secrets.randbelow(1000)}",
+        "MUSIC_U": parsed_cookie["MUSIC_U"],
+    }
+    payload = {**data, "header": header}
+    encrypted = eapi_encrypt(
+        path,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+    url = "https://interfacepc.music.163.com/eapi/" + path.removeprefix("/api/").lstrip("/")
+    eapi_cookie = "; ".join(
+        f"{urllib.parse.quote(str(name), safe='')}={urllib.parse.quote(str(value), safe='')}"
+        for name, value in header.items()
+    )
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(encrypted).encode("ascii"),
+        headers={
+            "User-Agent": (
+                "NeteaseMusicDesktop/3.1.17.204416 "
+                "(Windows; Microsoft-Windows-10-Professional-build-19045-64bit)"
+            ),
+            "Cookie": eapi_cookie,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = _decode_netease_payload(response.read(2_000_000))
+    except urllib.error.HTTPError as exc:
+        try:
+            result = _decode_netease_payload(exc.read(2_000_000))
+        except (NetEaseError, UpstreamOutcomeUnknown):
+            result = {}
+        if _known_auth_failure(result):
+            _expire_current_session()
+        raise NetEaseRequestRejected(
+            f"NETEASE_REQUEST_REJECTED: NetEase rejected the Together message with HTTP {exc.code}."
+        ) from None
+    except urllib.error.URLError:
+        raise UpstreamOutcomeUnknown(
+            "Together message submission could not be confirmed; delivery is unknown and was not retried."
+        ) from None
+    if _known_auth_failure(result):
+        _expire_current_session()
+    if _response_code(result) != 200:
+        raise NetEaseRequestRejected(
+            "NETEASE_REQUEST_REJECTED: NetEase rejected the Together message."
+        )
+    return result
+
+
 def _realtime_token_cookie(cookie: str) -> str:
     replaced = {
         "os",
@@ -992,57 +1061,32 @@ def send_together_listen_message(text: Any) -> str:
             "The connected NetEase account is not currently in a Listen Together room."
         )
 
-    account = netease_request("https://music.163.com/api/nuser/account/get")
-    profile = account.get("profile") if isinstance(account.get("profile"), dict) else {}
-    account_info = account.get("account") if isinstance(account.get("account"), dict) else {}
-    user_id = profile.get("userId") or account_info.get("id")
-    credentials = _get_together_realtime_credentials()
-    script = os.path.join(os.path.dirname(__file__), "scripts", "send_together_message.mjs")
     payload = {
-        "roomId": str(room_id),
-        "chatRoomId": str(chat_room_id),
-        "text": normalized,
-        "credentials": credentials,
-        "profile": {
-            "userId": str(user_id) if user_id else None,
-            "nick": profile.get("nickname"),
-            "avatar": profile.get("avatarUrl"),
-            "gender": profile.get("gender"),
-        },
+        "chatroomId": str(chat_room_id),
+        "msgType": 0,
+        "clientExt": json.dumps(
+            {
+                "bizType": "listenTogether",
+                "ltType": "FRIEND",
+                "roomId": str(room_id),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "msgBody": json.dumps(
+            {"msg": normalized, "msgType": 0},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
     }
-    try:
-        completed = subprocess.run(
-            ["node", script],
-            input=json.dumps(payload, ensure_ascii=False),
-            text=True,
-            capture_output=True,
-            timeout=45,
-            check=False,
-        )
-    except FileNotFoundError:
-        raise NetEaseError("The Together chat runtime is unavailable.") from None
-    except subprocess.TimeoutExpired:
-        raise UpstreamOutcomeUnknown(
-            "Together message confirmation timed out; delivery is unknown and was not retried."
-        ) from None
-
-    raw_result = completed.stdout.strip().splitlines()
-    try:
-        result = json.loads(raw_result[-1]) if raw_result else {}
-    except json.JSONDecodeError:
-        result = {}
-    if completed.returncode != 0 or result.get("ok") is not True:
-        detail = result.get("error") if isinstance(result.get("error"), str) else "Together message failed."
-        if result.get("definitive") is True:
-            raise NetEaseError(detail)
-        raise UpstreamOutcomeUnknown(
-            f"{detail} Delivery is unknown and was not retried."
-        )
+    result = _netease_eapi_request("/api/middle/im/chatroom/send", payload)
+    result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    result_body = result_data.get("msgBody") if isinstance(result_data.get("msgBody"), dict) else {}
     safe_result = {
         "ok": True,
         "roomId": str(room_id),
         "chatRoomId": str(chat_room_id),
-        "messageId": result.get("messageId"),
+        "messageId": result_body.get("msgId") or result_data.get("msgId"),
         "text": normalized,
         "code": result.get("code", 200),
     }
