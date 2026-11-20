@@ -35,6 +35,7 @@ def load_server(
     *,
     default_timezone="Asia/Shanghai",
     legacy_preview_env=None,
+    allow_together_chat="false",
 ):
     env = {
         "MCP_READ_ONLY": read_only,
@@ -44,6 +45,7 @@ def load_server(
         "MCP_OAUTH_PASSWORD": "a-different-oauth-password" if oauth else "",
         "MCP_STORAGE_PATH": "",
         "MCP_DEFAULT_TIMEZONE": default_timezone,
+        "MCP_ALLOW_TOGETHER_CHAT": allow_together_chat,
     }
     with mock.patch.dict(os.environ, env, clear=False):
         for name in (
@@ -62,6 +64,66 @@ def load_server(
 
 
 class ToolTests(unittest.TestCase):
+    def test_together_chat_tool_is_scoped_independently_from_write_tools(self):
+        disabled = load_server("true")
+        self.assertNotIn(
+            "send_together_listen_message",
+            {tool["name"] for tool in disabled.available_tools()},
+        )
+
+        enabled = load_server("true", allow_together_chat="true")
+        names = {tool["name"] for tool in enabled.available_tools()}
+        self.assertIn("send_together_listen_message", names)
+        self.assertNotIn("create_playlist", names)
+        self.assertIn("netease.chat", enabled.OAUTH_SCOPE.split())
+
+    def test_together_chat_uses_current_room_and_confirms_exact_message(self):
+        module = load_server("true", allow_together_chat="true")
+        room_status = {
+            "code": 200,
+            "data": {
+                "inRoom": True,
+                "roomInfo": {"roomId": "room-1", "chatRoomId": "123456"},
+            },
+        }
+        account = {
+            "code": 200,
+            "account": {"id": 42},
+            "profile": {
+                "userId": 42,
+                "nickname": "Aster",
+                "avatarUrl": "https://example.test/avatar.jpg",
+                "gender": 0,
+            },
+        }
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            captured["payload"] = json.loads(kwargs["input"])
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout='{"ok":true,"messageId":"msg-1","code":200}\n',
+                stderr="",
+            )
+
+        with mock.patch.object(module, "_netease_weapi_request", return_value=room_status), mock.patch.object(
+            module, "netease_request", return_value=account
+        ), mock.patch.object(
+            module,
+            "_get_together_realtime_credentials",
+            return_value={"accId": "42", "token": "short-lived", "addresses": []},
+        ), mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+            result = json.loads(module.send_together_listen_message("  瑶瑶，听见啦  "))
+
+        self.assertEqual(result["text"], "瑶瑶，听见啦")
+        self.assertEqual(result["messageId"], "msg-1")
+        self.assertEqual(captured["payload"]["roomId"], "room-1")
+        self.assertEqual(captured["payload"]["chatRoomId"], "123456")
+        self.assertEqual(captured["payload"]["text"], "瑶瑶，听见啦")
+        self.assertEqual(captured["payload"]["credentials"]["token"], "short-lived")
+
     def recent_play_event(self, default_timezone, played_at_utc):
         module = load_server("true", default_timezone=default_timezone)
         play_time_ms = int(played_at_utc.timestamp() * 1000)
