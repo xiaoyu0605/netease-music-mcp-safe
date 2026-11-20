@@ -222,6 +222,10 @@ create_curated_playlist 一次创建并核验
 `MCP_READ_ONLY=true` 是默认值，此时账户写入工具不会出现在 `tools/list` 中，登录态工具仍然
 可用。
 
+`MCP_ALLOW_TOGETHER_CHAT=true` 可独立开放 `send_together_listen_message`，无需同时开放歌单、
+收藏等账户写入工具。它只向当前“一起听”聊天室发送一条用户明确给出的文本，单次最多 500 字；
+若发送确认丢失，服务不会自动重试，避免重复消息。
+
 ### 读取工具
 
 | 工具 | 当前接口与语义 |
@@ -535,6 +539,7 @@ OAuth 是可选的：必须同时设置 `MCP_PUBLIC_URL` 与 `MCP_OAUTH_PASSWORD
 | `MCP_HOST` | `127.0.0.1` | Zeabur 使用 `0.0.0.0`。 |
 | `MCP_PORT` | `3456` | 显式 MCP 端口；未设置时读取平台 `PORT`，再回退到 3456。 |
 | `MCP_READ_ONLY` | `true` | 设为 `false` 才注册写入工具。 |
+| `MCP_ALLOW_TOGETHER_CHAT` | `false` | 独立注册当前“一起听”房间消息发送工具。 |
 | `MCP_ALLOWED_ORIGIN` | 空 | 仅在确有浏览器跨域需求时设置单个允许 origin。 |
 | `MCP_MAX_REQUEST_BYTES` | `1048576`；至少 1024 | HTTP 请求体上限。 |
 | `MCP_DEFAULT_TIMEZONE` | `Asia/Shanghai`；有效 IANA 名称 | 本地展示和日期语言语境；UTC 仍是规范存储时间。 |

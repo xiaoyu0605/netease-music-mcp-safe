@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import threading
 import time
 import uuid
@@ -59,6 +60,12 @@ READ_ONLY = os.environ.get("MCP_READ_ONLY", "true").strip().lower() not in {
     "no",
     "off",
 }
+ALLOW_TOGETHER_CHAT = os.environ.get("MCP_ALLOW_TOGETHER_CHAT", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 ALLOWED_ORIGIN = os.environ.get("MCP_ALLOWED_ORIGIN", "").strip()
 MAX_REQUEST_BYTES = int(os.environ.get("MCP_MAX_REQUEST_BYTES", "1048576"))
 PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
@@ -85,11 +92,12 @@ OPERATION_RETENTION_DAYS = int(os.environ.get("MCP_OPERATION_RETENTION_DAYS", "9
 MAX_OPERATION_LOGS = int(os.environ.get("MCP_MAX_OPERATION_LOGS", "1000"))
 MAX_IMAGE_BYTES = int(os.environ.get("MCP_MAX_IMAGE_BYTES", "5242880"))
 MAX_IMAGE_PIXELS = int(os.environ.get("MCP_MAX_IMAGE_PIXELS", "25000000"))
-OAUTH_SCOPE = (
-    "netease.read netease.session"
-    if READ_ONLY
-    else "netease.read netease.session netease.write"
-)
+_oauth_scopes = ["netease.read", "netease.session"]
+if not READ_ONLY:
+    _oauth_scopes.append("netease.write")
+if ALLOW_TOGETHER_CHAT:
+    _oauth_scopes.append("netease.chat")
+OAUTH_SCOPE = " ".join(_oauth_scopes)
 USED_AUTHORIZATION_CODES: dict[str, int] = {}
 USED_CODES_LOCK = threading.Lock()
 FAILED_LOGINS: dict[str, list[int]] = {}
@@ -172,6 +180,7 @@ SESSION_MUTATING_TOOL_NAMES = {
     "check_netease_qr_login",
     "logout_netease",
 }
+TOGETHER_CHAT_TOOL_NAMES = {"send_together_listen_message"}
 
 
 def _tool(
@@ -396,6 +405,19 @@ READ_TOOLS = [
         destructive=True,
     ),
 ]
+
+TOGETHER_CHAT_TOOLS = [
+    _tool(
+        "send_together_listen_message",
+        "Send exactly one user-approved text message from the connected NetEase account into its current Listen Together room. Call only when the user supplies or explicitly approves the exact text. Never retry automatically because delivery may have succeeded even if confirmation is lost.",
+        {
+            "text": {"type": "string", "minLength": 1, "maxLength": 500},
+        },
+        ["text"],
+        read_only=False,
+    ),
+]
+
 
 WRITE_TOOLS = [
     _tool(
@@ -816,6 +838,215 @@ def netease_request(url: str, data: dict[str, Any] | str | None = None) -> dict[
     if _ambiguous_request_rejection(result):
         _raise_ambiguous_rejection()
     return result
+
+
+def _netease_weapi_request(path: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    cookie = _require_cookie()
+    csrf = parse_cookie(cookie).get("__csrf", "")
+    payload = {**(data or {}), "csrf_token": csrf}
+    encrypted = weapi_encrypt(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+    url = "https://music.163.com/weapi/" + path.removeprefix("/api/").lstrip("/")
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(encrypted).encode("ascii"),
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://music.163.com/",
+            "Origin": "https://music.163.com",
+            "Cookie": cookie,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = _decode_netease_payload(response.read(2_000_000))
+    except urllib.error.HTTPError as exc:
+        try:
+            result = _decode_netease_payload(exc.read(2_000_000))
+        except (NetEaseError, UpstreamOutcomeUnknown):
+            result = {}
+        if _known_auth_failure(result):
+            _expire_current_session()
+        raise NetEaseRequestRejected(
+            f"NETEASE_REQUEST_REJECTED: NetEase rejected the Together request with HTTP {exc.code}."
+        ) from None
+    except urllib.error.URLError:
+        raise UpstreamOutcomeUnknown(
+            "NetEase Together could not be reached; the result is unknown."
+        ) from None
+    if _known_auth_failure(result):
+        _expire_current_session()
+    if _response_code(result) not in (None, 200):
+        raise NetEaseRequestRejected(
+            "NETEASE_REQUEST_REJECTED: NetEase rejected the Together request."
+        )
+    return result
+
+
+def _realtime_token_cookie(cookie: str) -> str:
+    replaced = {
+        "os",
+        "osver",
+        "appver",
+        "channel",
+        "versioncode",
+        "buildver",
+        "resolution",
+        "requestid",
+    }
+    preserved = []
+    for part in cookie.split(";"):
+        normalized = part.strip()
+        if not normalized:
+            continue
+        key = normalized.partition("=")[0].strip().lower()
+        if key not in replaced:
+            preserved.append(normalized)
+    now_ms = int(time.time() * 1000)
+    request_id = f"{now_ms}_{secrets.randbelow(10000):04d}"
+    return "; ".join(
+        [
+            *preserved,
+            "osver=15.5",
+            "os=osx",
+            "appver=3.1.10.5100",
+            "channel=netease",
+            "versioncode=140",
+            f"buildver={now_ms // 1000}",
+            "resolution=1920x1080",
+            f"requestId={request_id}",
+        ]
+    )
+
+
+def _get_together_realtime_credentials() -> dict[str, Any]:
+    cookie = _require_cookie()
+    url = (
+        "https://interface3.music.163.com/api/middle/im/token/get"
+        "?bizName=music_listenTogether"
+    )
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Cookie": _realtime_token_cookie(cookie),
+            "Accept": "application/json",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = _decode_netease_payload(response.read(1_000_000))
+    except urllib.error.HTTPError as exc:
+        raise NetEaseRequestRejected(
+            f"NETEASE_REQUEST_REJECTED: NetEase rejected realtime credentials with HTTP {exc.code}."
+        ) from None
+    except urllib.error.URLError:
+        raise UpstreamOutcomeUnknown(
+            "NetEase realtime credentials could not be reached; no message was sent."
+        ) from None
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    acc_id = data.get("accId")
+    token = data.get("token")
+    addresses = data.get("addr") if isinstance(data.get("addr"), list) else []
+    if _response_code(result) != 200 or not isinstance(acc_id, (str, int)) or not token:
+        raise NetEaseRequestRejected(
+            "NETEASE_REQUEST_REJECTED: NetEase did not provide realtime credentials."
+        )
+    return {
+        "accId": str(acc_id),
+        "token": str(token),
+        "addresses": [item for item in addresses if isinstance(item, str)],
+    }
+
+
+def send_together_listen_message(text: Any) -> str:
+    if not ALLOW_TOGETHER_CHAT:
+        raise PermissionError(
+            "Together chat is disabled. Set MCP_ALLOW_TOGETHER_CHAT=true to enable it."
+        )
+    if not isinstance(text, str):
+        raise ValueError("text must be a string.")
+    normalized = text.strip()
+    if not normalized or len(normalized) > 500:
+        raise ValueError("text must be between 1 and 500 characters.")
+
+    status = _netease_weapi_request("/api/listen/together/status/get")
+    data = status.get("data") if isinstance(status.get("data"), dict) else {}
+    room_info = data.get("roomInfo") if isinstance(data.get("roomInfo"), dict) else {}
+    if not room_info and isinstance(status.get("roomInfo"), dict):
+        room_info = status["roomInfo"]
+    in_room = data.get("inRoom") is True or status.get("inRoom") is True
+    room_id = room_info.get("roomId") or data.get("roomId")
+    chat_room_id = room_info.get("chatRoomId") or data.get("chatRoomId")
+    if not in_room or not room_id or not chat_room_id:
+        raise NetEaseError(
+            "The connected NetEase account is not currently in a Listen Together room."
+        )
+
+    account = netease_request("https://music.163.com/api/nuser/account/get")
+    profile = account.get("profile") if isinstance(account.get("profile"), dict) else {}
+    account_info = account.get("account") if isinstance(account.get("account"), dict) else {}
+    user_id = profile.get("userId") or account_info.get("id")
+    credentials = _get_together_realtime_credentials()
+    script = os.path.join(os.path.dirname(__file__), "scripts", "send_together_message.mjs")
+    payload = {
+        "roomId": str(room_id),
+        "chatRoomId": str(chat_room_id),
+        "text": normalized,
+        "credentials": credentials,
+        "profile": {
+            "userId": str(user_id) if user_id else None,
+            "nick": profile.get("nickname"),
+            "avatar": profile.get("avatarUrl"),
+            "gender": profile.get("gender"),
+        },
+    }
+    try:
+        completed = subprocess.run(
+            ["node", script],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise NetEaseError("The Together chat runtime is unavailable.") from None
+    except subprocess.TimeoutExpired:
+        raise UpstreamOutcomeUnknown(
+            "Together message confirmation timed out; delivery is unknown and was not retried."
+        ) from None
+
+    raw_result = completed.stdout.strip().splitlines()
+    try:
+        result = json.loads(raw_result[-1]) if raw_result else {}
+    except json.JSONDecodeError:
+        result = {}
+    if completed.returncode != 0 or result.get("ok") is not True:
+        detail = result.get("error") if isinstance(result.get("error"), str) else "Together message failed."
+        if result.get("definitive") is True:
+            raise NetEaseError(detail)
+        raise UpstreamOutcomeUnknown(
+            f"{detail} Delivery is unknown and was not retried."
+        )
+    safe_result = {
+        "ok": True,
+        "roomId": str(room_id),
+        "chatRoomId": str(chat_room_id),
+        "messageId": result.get("messageId"),
+        "text": normalized,
+        "code": result.get("code", 200),
+    }
+    return json.dumps(safe_result, ensure_ascii=False)
 
 
 def netease_binary_request(url: str, data: bytes, headers: dict[str, str]) -> dict[str, Any]:
@@ -4140,7 +4371,10 @@ def _execute_direct_write(operation: str, raw_arguments: dict[str, Any]) -> str:
 
 
 def available_tools() -> list[dict[str, Any]]:
-    return READ_TOOLS if READ_ONLY else READ_TOOLS + WRITE_TOOLS
+    tools = list(READ_TOOLS if READ_ONLY else READ_TOOLS + WRITE_TOOLS)
+    if ALLOW_TOGETHER_CHAT:
+        tools.extend(TOGETHER_CHAT_TOOLS)
+    return tools
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> str:
@@ -4148,6 +4382,8 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
         raise PermissionError("Write tools are disabled. Set MCP_READ_ONLY=false to enable them.")
     if name in WRITE_TOOL_NAMES:
         return _execute_direct_write(name, arguments)
+    if name == "send_together_listen_message":
+        return send_together_listen_message(arguments.get("text"))
     if name == "get_netease_login_status":
         return get_netease_login_status()
     if name == "start_netease_qr_login":
@@ -4626,6 +4862,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             return
         requested_scopes = set(params.get("scope", "netease.read").split())
         write_requested = "netease.write" in requested_scopes
+        chat_requested = "netease.chat" in requested_scopes
         hidden = "".join(
             f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(value)}">'
             for key, value in params.items()
@@ -4644,6 +4881,11 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             access_text += (
                 " This also allows starting, checking, persisting, and clearing the deployment-level "
                 "NetEase QR login session; the client never receives the resulting cookie."
+            )
+        if chat_requested:
+            access_text += (
+                " This also allows sending a user-approved message into the account's current "
+                "NetEase Listen Together room."
             )
         write_confirmation = (
             '<label class="warning"><input type="checkbox" name="confirm_write" value="yes" required> '
@@ -4882,13 +5124,15 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 params = body.get("params") or {}
                 tool_name = str(params.get("name", "")) if isinstance(params, dict) else ""
                 if (
-                    tool_name in WRITE_TOOL_NAMES | SESSION_MUTATING_TOOL_NAMES
+                    tool_name in WRITE_TOOL_NAMES | SESSION_MUTATING_TOOL_NAMES | TOGETHER_CHAT_TOOL_NAMES
                     and not self._static_token_authorized()
                 ):
                     claims = self._oauth_access_claims() or {}
                     required_scope = (
                         "netease.write"
                         if tool_name in WRITE_TOOL_NAMES
+                        else "netease.chat"
+                        if tool_name in TOGETHER_CHAT_TOOL_NAMES
                         else "netease.session"
                     )
                     if required_scope not in str(claims.get("scope", "")).split():
