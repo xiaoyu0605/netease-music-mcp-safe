@@ -86,43 +86,30 @@ class ToolTests(unittest.TestCase):
                 "roomInfo": {"roomId": "room-1", "chatRoomId": "123456"},
             },
         }
-        account = {
-            "code": 200,
-            "account": {"id": 42},
-            "profile": {
-                "userId": 42,
-                "nickname": "Aster",
-                "avatarUrl": "https://example.test/avatar.jpg",
-                "gender": 0,
-            },
-        }
         captured = {}
 
-        def fake_run(command, **kwargs):
-            captured["command"] = command
-            captured["payload"] = json.loads(kwargs["input"])
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                stdout='{"ok":true,"messageId":"msg-1","code":200}\n',
-                stderr="",
-            )
+        def fake_eapi(path, payload):
+            captured["path"] = path
+            captured["payload"] = payload
+            return {"code": 200, "data": {"msgBody": {"msgId": "msg-1"}}}
 
         with mock.patch.object(module, "_netease_weapi_request", return_value=room_status), mock.patch.object(
-            module, "netease_request", return_value=account
-        ), mock.patch.object(
-            module,
-            "_get_together_realtime_credentials",
-            return_value={"accId": "42", "token": "short-lived", "addresses": []},
-        ), mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+            module, "_netease_eapi_request", side_effect=fake_eapi
+        ):
             result = json.loads(module.send_together_listen_message("  瑶瑶，听见啦  "))
 
         self.assertEqual(result["text"], "瑶瑶，听见啦")
         self.assertEqual(result["messageId"], "msg-1")
-        self.assertEqual(captured["payload"]["roomId"], "room-1")
-        self.assertEqual(captured["payload"]["chatRoomId"], "123456")
-        self.assertEqual(captured["payload"]["text"], "瑶瑶，听见啦")
-        self.assertEqual(captured["payload"]["credentials"]["token"], "short-lived")
+        self.assertEqual(captured["path"], "/api/middle/im/chatroom/send")
+        self.assertEqual(captured["payload"]["chatroomId"], "123456")
+        self.assertEqual(
+            json.loads(captured["payload"]["clientExt"]),
+            {"bizType": "listenTogether", "ltType": "FRIEND", "roomId": "room-1"},
+        )
+        self.assertEqual(
+            json.loads(captured["payload"]["msgBody"]),
+            {"msg": "瑶瑶，听见啦", "msgType": 0},
+        )
 
     def recent_play_event(self, default_timezone, played_at_utc):
         module = load_server("true", default_timezone=default_timezone)
@@ -1192,6 +1179,21 @@ class NetEaseSessionTests(unittest.TestCase):
         self.assertTrue(encrypted["params"])
         self.assertEqual(len(encrypted["encSecKey"]), 256)
         int(encrypted["encSecKey"], 16)
+
+    def test_eapi_encryption_matches_known_vector(self):
+        from netease_session import eapi_encrypt
+
+        encrypted = eapi_encrypt("/api/test", '{"hello":"世界"}')
+        self.assertEqual(
+            encrypted,
+            {
+                "params": (
+                    "4DC723619A991588865191FD2F319BAD8954CD01D5119DCCE845005F60FF9CD9"
+                    "3496540C14EDC72ADAF3BAE139050632461886D4E4FBB9D0F84A21F6326F7EA"
+                    "052841AACBC0D6F987FD91BB1BCFF8F4D3293E8BC5BE63D2AE739E2A82749920C"
+                )
+            },
+        )
 
     def test_confirmed_qr_login_persists_session_without_returning_it(self):
         store = self.configure_storage()
